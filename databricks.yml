@@ -1,0 +1,15 @@
+# Databricks Asset Bundle: describes jobs/endpoints/apps as code so they can be
+# deployed the same way to any environment. Not used until Phase 5 (deployment).
+# Fill in your workspace URL before running `databricks bundle validate`.
+bundle:
+  name: beauty-ai-lab
+
+include:
+  - resources/*.yml
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://REPLACE-WITH-YOUR-WORKSPACE-URL

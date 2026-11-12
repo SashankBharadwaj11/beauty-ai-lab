@@ -1,0 +1,23 @@
+# Data never goes in Git: it lives in the Unity Catalog volume
+*.zip
+data/
+*.csv.gz
+*.parquet
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Secrets and local config
+.env
+*.pem
+.databrickscfg
+
+# Bundle and editor output
+.databricks/
+.vscode/
+.idea/
+.DS_Store

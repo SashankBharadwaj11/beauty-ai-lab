@@ -1,0 +1,15 @@
+# The nightly ingestion pipeline as a job: tables first, then documents.
+# Serverless compute is used because no cluster is specified.
+resources:
+  jobs:
+    bcia_ingestion:
+      name: bcia-ingestion
+      tasks:
+        - task_key: tables
+          notebook_task:
+            notebook_path: ../notebooks/02_bronze_silver_gold.py
+        - task_key: documents
+          depends_on:
+            - task_key: tables
+          notebook_task:
+            notebook_path: ../notebooks/03_documents_manifest_parsing.py
