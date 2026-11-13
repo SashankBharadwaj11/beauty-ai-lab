@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # MAGIC %md
 # MAGIC # Run the unit tests inside Databricks
 # MAGIC Proves two things: the `src/` code is importable from this Git folder, and its logic passes.

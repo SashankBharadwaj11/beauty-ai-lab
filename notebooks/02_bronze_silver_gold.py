@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # MAGIC %md
 # MAGIC # Day 2: From CSV files to trustworthy Bronze, Silver and Gold tables
 # MAGIC **Beauty Campaign Intelligence Assistant (BCIA). Every row is synthetic training data. None of it is Estée Lauder or C5i data.**
@@ -183,11 +187,459 @@ assert all(r[3] == "PASS" for r in result), "Bronze row counts do not match the 
 
 # COMMAND ----------
 
+# DBTITLE 1,Quick look: campaign_id NULL counts
 # MAGIC %sql
 # MAGIC SELECT count_if(campaign_id IS NULL) AS null_campaign,
 # MAGIC        count_if(campaign_id IS NOT NULL) AS with_campaign,
 # MAGIC        min(order_date) AS first_order, max(order_date) AS last_order      -- strings in bronze: '2026-01-01' / '2026-11-06'
-# MAGIC FROM bronze_fact_orders
+# MAGIC FROM workspace.ai_architect_lab.bronze_fact_orders
+
+# COMMAND ----------
+
+# DBTITLE 1,Section 3b: Data profiling (before Silver)
+# MAGIC %md
+# MAGIC ## 3b. Data profiling: interrogate the data BEFORE you clean it
+# MAGIC Silver cleaning decides what to *reject*. Profiling first decides what to *expect*. We ask six questions of the raw Bronze data before writing a single Silver rule, so every rule that follows is aimed at a risk we have already measured, not guessed:
+# MAGIC
+# MAGIC 1. **Shape** — how many rows and columns, where are the nulls, and do the text dates and numbers actually convert?
+# MAGIC 2. **Grain** — what does one row *mean*, and is the key we think is unique really unique? This is the fan-out check: the CAM009 "$48 million instead of $98,647" story in section 9 starts life as a grain error, caught here in minutes instead of in a stakeholder meeting.
+# MAGIC 3. **Distributions** — smallest, largest and most common values: negative quantities, future dates, odd ID codes.
+# MAGIC 4. **Relationships** — when two tables join, do the keys actually match, or are there orphans (a sale pointing to a product that doesn't exist)?
+# MAGIC 5. **Reconciliation** — do totals that should agree actually agree (row formulas, spend vs budget)? This is how you spot spend at 7–12x budget *before* it reaches a dashboard.
+# MAGIC 6. **Meaning** — does the data make business sense (shouldn't bad reviews carry low ratings)?
+# MAGIC
+# MAGIC **Expected on the baseline:** clean counts, zero cast failures, zero duplicate keys, zero orphans — but reconciliation and meaning each surface one real *business question* for the source owner. Profiling that only ever says PASS is profiling nobody looked at.
+
+# COMMAND ----------
+
+# DBTITLE 1,Profiling 1/6: shape, nulls, casts
+LINEAGE_COLS = ["_source_file", "_source_modified_at", "_ingested_at", "_batch_id"]
+
+# Columns Silver will try_cast later, and the type they must become. A failing row here is a bad SOURCE value,
+# not a bad rule — far cheaper to find now, in Bronze, than as a surprise inside write_silver().
+CAST_PROBES = {
+    "dim_product":         {"list_price_usd": "DECIMAL(10,2)", "launch_date": "DATE"},
+    "dim_campaign":        {"start_date": "DATE", "end_date": "DATE", "budget_usd": "DECIMAL(12,2)"},
+    "fact_orders":         {"order_date": "DATE", "quantity": "INT", "gross_sales_usd": "DECIMAL(12,2)",
+                            "discount_usd": "DECIMAL(12,2)", "returns_usd": "DECIMAL(12,2)", "net_sales_usd": "DECIMAL(12,2)"},
+    "fact_campaign_daily": {"event_date": "DATE", "impressions": "BIGINT", "clicks": "BIGINT", "spend_usd": "DECIMAL(12,2)",
+                            "attributed_orders": "INT", "attributed_revenue_usd": "DECIMAL(12,2)"},
+    "fact_inventory":      {"snapshot_date": "DATE", "on_hand_units": "INT", "reserved_units": "INT"},
+    "fact_reviews":        {"review_date": "DATE", "rating": "INT"},
+}
+
+shape_rows = []
+for t in EXPECTED_ROWS:
+    df = spark.table(fq(f"bronze_{t}"))
+    biz_cols = [c for c in df.columns if c not in LINEAGE_COLS]
+    print(f"bronze_{t}: {df.count():,} rows x {len(biz_cols)} business columns (+ 4 lineage columns)")
+    for c in biz_cols:
+        n_null = df.selectExpr(f"count_if({c} IS NULL)").first()[0]
+        if n_null:
+            shape_rows.append((t, c, "null values", n_null))
+    for c, target in CAST_PROBES.get(t, {}).items():
+        n_bad = df.selectExpr(f"count_if({c} IS NOT NULL AND try_cast({c} AS {target}) IS NULL)").first()[0]
+        shape_rows.append((t, c, f"fails cast to {target}", n_bad))
+
+display(spark.createDataFrame(shape_rows, "table STRING, column STRING, problem STRING, rows_affected BIGINT")
+        .filter("rows_affected > 0"))
+unexpected = [r for r in shape_rows
+              if r[3] > 0 and not (r[0] == "fact_orders" and r[1] == "campaign_id" and r[2] == "null values")]
+assert not unexpected, f"Unexpected shape problems: {unexpected}"
+print("PASS 1/6 shape: the only nulls are fact_orders.campaign_id (the organic orders). Every text date, number and rating converts cleanly.")
+
+# COMMAND ----------
+
+# DBTITLE 1,Profiling 2/6: grain and fan-out
+GRAIN = {
+    "dim_brand":          (["brand_id"], "one brand"),
+    "dim_channel":        (["channel_id"], "one sales channel"),
+    "dim_market":         (["market_id"], "one market (city)"),
+    "dim_product":        (["product_id"], "one product"),
+    "dim_campaign":       (["campaign_id"], "one campaign"),
+    "fact_orders":        (["order_line_id"], "one order line: one product within one order"),
+    "fact_campaign_daily": (["campaign_id", "product_id", "market_id", "channel_id", "event_date"],
+                            "one campaign x product x market x channel x day"),
+    "fact_inventory":     (["snapshot_id"], "one product x market x day inventory snapshot"),
+    "fact_reviews":       (["review_id"], "one review"),
+}
+
+grain_rows = []
+for t, (pk, meaning) in GRAIN.items():
+    df = spark.table(fq(f"bronze_{t}"))
+    n, d = df.count(), df.select(*pk).distinct().count()
+    grain_rows.append((t, meaning, "+".join(pk), n, d, n - d, "PASS" if n == d else "FAIL"))
+display(spark.createDataFrame(grain_rows,
+    "table STRING, one_row_means STRING, natural_key STRING, rows BIGINT, distinct_keys BIGINT, duplicate_rows BIGINT, status STRING"))
+assert all(g[6] == "PASS" for g in grain_rows), "Duplicate natural keys: any join on them will fan out."
+
+# Feel the fan-out in numbers: join order lines to daily campaign data on campaign_id ALONE (a non-unique key on both sides).
+orders = spark.table(fq("bronze_fact_orders")).filter("campaign_id IS NOT NULL")
+naive_rows = orders.join(spark.table(fq("bronze_fact_campaign_daily")), "campaign_id").count()
+print(f"{orders.count():,} campaign order lines joined on campaign_id alone -> {naive_rows:,} rows "
+      f"(~{naive_rows // orders.count()}x fan-out).")
+print("campaign_id is not unique on EITHER side, so every order line multiplied by ~490 daily rows. "
+      "The fix is always the same: aggregate one side to the shared grain first — section 9 shows the WRONG and the RIGHT SQL.")
+print("PASS 2/6 grain: every natural key is unique.")
+
+# COMMAND ----------
+
+# DBTITLE 1,Profiling 3/6: distributions
+o, cd, rv = (spark.table(fq(f"bronze_{t}")) for t in ["fact_orders", "fact_campaign_daily", "fact_reviews"])
+
+dist_checks = []
+def chk(name, value, ok):
+    dist_checks.append((name, value, "PASS" if ok else "FAIL"))
+
+r = o.selectExpr(
+    "min(order_date) mn", "max(order_date) mx",
+    "min(try_cast(quantity AS INT)) min_qty", "max(try_cast(quantity AS INT)) max_qty",
+    "count_if(try_cast(quantity AS INT) < 0) neg_qty",
+    "count_if(try_cast(order_date AS DATE) > current_date()) future_dates",
+    "count_if(order_line_id NOT RLIKE '^[A-Z]+[0-9]+$') bad_order_ids",
+    "count_if(campaign_id IS NOT NULL AND campaign_id NOT RLIKE '^[A-Z]+[0-9]+$') bad_campaign_ids").first()
+chk("fact_orders: order_date range", f"{r.mn} .. {r.mx}; future-dated={r.future_dates}", r.future_dates == 0)
+chk("fact_orders: quantity", f"{r.min_qty} .. {r.max_qty}; negatives={r.neg_qty}", r.neg_qty == 0 and r.min_qty >= 0)
+chk("fact_orders: ID codes", f"odd order IDs={r.bad_order_ids}, odd campaign IDs={r.bad_campaign_ids}",
+    r.bad_order_ids == 0 and r.bad_campaign_ids == 0)
+
+r2 = cd.selectExpr("min(try_cast(spend_usd AS DECIMAL(12,2))) mn", "max(try_cast(spend_usd AS DECIMAL(12,2))) mx",
+    "count_if(try_cast(clicks AS BIGINT) > try_cast(impressions AS BIGINT)) clicks_gt_impr").first()
+chk("fact_campaign_daily: spend", f"{r2.mn} .. {r2.mx}", r2.mn >= 0)
+chk("fact_campaign_daily: clicks <= impressions", f"violations={r2.clicks_gt_impr}", r2.clicks_gt_impr == 0)
+
+r3 = rv.selectExpr("min(try_cast(rating AS INT)) mn", "max(try_cast(rating AS INT)) mx",
+    "count_if(try_cast(review_date AS DATE) > current_date()) future").first()
+chk("fact_reviews: rating 1..5, not future-dated", f"{r3.mn} .. {r3.mx}; future-dated={r3.future}",
+    r3.mn == 1 and r3.mx == 5 and r3.future == 0)
+
+display(spark.createDataFrame(dist_checks, "check STRING, value STRING, status STRING"))
+assert all(c[2] == "PASS" for c in dist_checks), "A distribution is outside its plausible range."
+
+# Most common values, not just the extremes: a market carrying half the orders changes how you read every average.
+display(o.groupBy("market_id").count()
+        .join(spark.table(fq("bronze_dim_market")), "market_id")
+        .select("market_name", "region", F.col("count").alias("order_lines"))
+        .orderBy(F.desc("order_lines")))
+print("PASS 3/6 distributions: no negatives, no future dates, no odd ID codes, clicks never exceed impressions.")
+
+# COMMAND ----------
+
+# DBTITLE 1,Profiling 4/6: relationships (orphan keys)
+FKS = [  # (table, foreign key, dimension, key may be NULL)
+    ("dim_product",         "brand_id",    "dim_brand",     False),
+    ("dim_campaign",        "brand_id",    "dim_brand",     False),
+    ("fact_orders",         "product_id",  "dim_product",   False),
+    ("fact_orders",         "market_id",   "dim_market",    False),
+    ("fact_orders",         "channel_id",  "dim_channel",  False),
+    ("fact_orders",         "campaign_id", "dim_campaign",  True),   # NULL = organic order, so not an orphan
+    ("fact_campaign_daily", "campaign_id", "dim_campaign",  False),
+    ("fact_campaign_daily", "product_id",  "dim_product",   False),
+    ("fact_campaign_daily", "market_id",   "dim_market",    False),
+    ("fact_campaign_daily", "channel_id",  "dim_channel",  False),
+    ("fact_inventory",      "product_id",  "dim_product",   False),
+    ("fact_inventory",      "market_id",   "dim_market",    False),
+    ("fact_reviews",        "product_id",  "dim_product",   False),
+    ("fact_reviews",        "market_id",   "dim_market",    False),
+]
+
+orphan_rows = []
+for t, fk, dim, nullable in FKS:
+    df = spark.table(fq(f"bronze_{t}"))
+    if nullable:
+        df = df.filter(F.col(fk).isNotNull())
+    orphans = df.join(spark.table(fq(f"bronze_{dim}")), fk, "left_anti").count()
+    orphan_rows.append((t, fk, dim, "may be NULL" if nullable else "required", orphans,
+                        "PASS" if orphans == 0 else "FAIL"))
+display(spark.createDataFrame(orphan_rows,
+    "table STRING, foreign_key STRING, joins_to STRING, key_nullability STRING, orphan_rows BIGINT, status STRING"))
+assert all(x[5] == "PASS" for x in orphan_rows), "Orphan keys: either the fact or the dimension is incomplete."
+print("PASS 4/6 relationships: every brand, product, market, channel and campaign referenced by a fact exists in its dimension.")
+
+# COMMAND ----------
+
+# DBTITLE 1,Profiling 5/6: reconciliation
+# a) Row level: net = gross - discount - returns, within one cent, on every row.
+v = o.selectExpr(
+    "count_if(abs(try_cast(gross_sales_usd AS DECIMAL(12,2)) - try_cast(discount_usd AS DECIMAL(12,2))"
+    "          - try_cast(returns_usd AS DECIMAL(12,2)) - try_cast(net_sales_usd AS DECIMAL(12,2))) > 0.01) violations").first()[0]
+print(f"net sales formula violations (|gross - discount - returns - net| > $0.01): {v}")
+assert v == 0, "Rows where net sales is not gross - discount - returns."
+
+# b) Aggregate level: spend vs budget. Different metrics, so they need not match —
+# but 7-12x is a question for the source owner, not a rule violation to silently quarantine.
+sb = (cd.groupBy("campaign_id")
+      .agg(F.expr("sum(try_cast(spend_usd AS DECIMAL(12,2)))").alias("spend_usd"))
+      .join(spark.table(fq("bronze_dim_campaign"))
+            .select("campaign_id", F.expr("try_cast(budget_usd AS DECIMAL(12,2))").alias("budget_usd")), "campaign_id")
+      .withColumn("spend_to_budget", F.expr("round(spend_usd / budget_usd, 1)")))
+display(sb.orderBy(F.desc("spend_to_budget")))
+lo, hi = sb.selectExpr("min(spend_to_budget) lo", "max(spend_to_budget) hi").first()
+print(f"WARN (business question, not a rule): every campaign spends {lo}x-{hi}x its budget. "
+      "Either budget_usd covers something smaller than the whole campaign (per day? per channel?), or spend is overstated. "
+      "Ask the source owner BEFORE building any overspend metric or alert on it.")
+print("PASS 5/6 reconciliation: the net sales formula holds on every row.")
+
+# COMMAND ----------
+
+# DBTITLE 1,Profiling 6/6: meaning
+# If sentiment_hint means anything, negative reviews should carry lower star ratings than positive ones.
+sent = (rv.groupBy("sentiment_hint")
+        .agg(F.round(F.avg(F.expr("try_cast(rating AS INT)")), 2).alias("avg_rating"),
+             F.min(F.expr("try_cast(rating AS INT)")).alias("min_rating"),
+             F.max(F.expr("try_cast(rating AS INT)")).alias("max_rating"),
+             F.count("*").alias("reviews")))
+display(sent.orderBy("sentiment_hint"))
+avg = {r.sentiment_hint: r.avg_rating for r in sent.collect()}
+print(f"avg rating by sentiment_hint: {avg}")
+print("WARN (business question, not a rule): sentiment_hint does NOT track the star rating — "
+      "negative, neutral and positive all average ~3.0 across the full 1..5 range. "
+      "Treat the star rating as the signal; ask the source owner where the hint came from before using it for anything. "
+      "Don't drop the column silently either — record the finding in the evidence log.")
+print("PASS 6/6 meaning: checks ran; one business question raised.")
+
+# COMMAND ----------
+
+# DBTITLE 1,Section 3b results: what profiling found
+# MAGIC %md
+# MAGIC **What profiling found on the baseline data**
+# MAGIC
+# MAGIC | Check | Result |
+# MAGIC |---|---|
+# MAGIC | Shape | row and column counts match the generator; the only nulls are `fact_orders.campaign_id` (15,754 organic orders); zero cast failures |
+# MAGIC | Grain | every natural key is unique; joining on `campaign_id` alone would fan 9,246 order lines out to 4,530,540 rows (~490x) |
+# MAGIC | Distributions | dates 2026-01-01 to 2026-11-06, quantity 1..4, ratings 1..5; no negatives, no future dates, no odd ID codes, clicks never exceed impressions |
+# MAGIC | Relationships | zero orphan keys across all 14 foreign-key checks |
+# MAGIC | Reconciliation | net = gross − discount − returns holds on all 25,000 rows; but every campaign spends 7.1x–12.2x its budget |
+# MAGIC | Meaning | `sentiment_hint` ignores the star rating (~3.0 average for all three sentiments) |
+# MAGIC
+# MAGIC Two findings survive as **questions for the source owner**, not Silver rules: what `budget_usd` covers, and where `sentiment_hint` came from. Profiling tells you which questions to ask; Silver rules encode the answers. After the defect experiment in section 8 dirties the data, rerun these six cells and watch them fail loudly instead of silently.
+# MAGIC
+# MAGIC **Record in `evidence_log.md`:** the six profiling checks, the 490x fan-out number, and the two WARN findings.
+
+# COMMAND ----------
+
+# DBTITLE 1,Data profiling: six questions
+# MAGIC %md
+# MAGIC ### 3b. Profile before you clean: six questions about the bronze data
+# MAGIC The quick look above (3a) answered one question informally. Profiling does it properly, **before Silver**, on the raw STRING bronze tables, so nothing is hidden by an earlier cast. Silver enforces rules; profiling tells you **which rules to write**.
+# MAGIC
+# MAGIC | # | Question | Why it matters |
+# MAGIC |---|---|---|
+# MAGIC | 1 | **Shape** | How many rows and columns? How many NULLs? Do dates and numbers stored as text actually convert? |
+# MAGIC | 2 | **Grain** | What does one row mean? Is the "unique" ID really unique? Wrong grain is how the CAM009 join in section 9 produces 48 million instead of 98,647 rows. |
+# MAGIC | 3 | **Distributions** | Smallest, largest and most common values. Catches negative quantities and future dates before they reach a dashboard. |
+# MAGIC | 4 | **Relationships** | When two tables join, do the keys match? An orphan key (a sale pointing to a product that doesn't exist) is a row Silver would quarantine - better to know now. |
+# MAGIC | 5 | **Reconciliation** | Do totals that should agree actually agree? This is where spend at 7-12x budget first shows up. |
+# MAGIC | 6 | **Meaning** | Does the data make business sense? Bad reviews should carry low ratings. |
+# MAGIC
+# MAGIC **Expected on the clean baseline:** every structural check passes - 0 conversion failures, 0 duplicate keys, 0 orphan keys, 0 broken arithmetic. Three **WARN**s are real and left in on purpose: campaigns spend 7.10x-12.19x their budget, attributed revenue is 2.07x company net sales, and 134 of 396 reviews rated 1-2 stars carry `sentiment_hint = 'positive'`. Section 10 re-checks the same three on gold after cleaning. These cells only *display* - nothing is written, and `dq_results` is still produced only by the end-of-notebook checks.
+
+# COMMAND ----------
+
+# DBTITLE 1,Profile 1: shape, nulls, type conversion
+# Question 1 - SHAPE: rows, columns, NULLs, and "does the text really convert?"
+# Bronze is all STRING by design, so conversion is tested with try_cast: a value that is present
+# in the source but try_casts to NULL is a broken date or number the source actually sent.
+# These are the exact casts Silver will use in section 4, tested on every row before any cleaning.
+
+TYPE_TARGETS = {                     # table -> {column: the type Silver will cast it to}
+    "dim_product":         {"launch_date": "DATE", "list_price_usd": "DECIMAL(10,2)"},
+    "dim_campaign":       {"start_date": "DATE", "end_date": "DATE", "budget_usd": "DECIMAL(12,2)"},
+    "fact_orders":        {"order_date": "DATE", "quantity": "INT", "gross_sales_usd": "DECIMAL(12,2)",
+                           "discount_usd": "DECIMAL(12,2)", "returns_usd": "DECIMAL(12,2)", "net_sales_usd": "DECIMAL(12,2)"},
+    "fact_campaign_daily": {"event_date": "DATE", "impressions": "BIGINT", "clicks": "BIGINT",
+                            "spend_usd": "DECIMAL(12,2)", "attributed_orders": "INT", "attributed_revenue_usd": "DECIMAL(12,2)"},
+    "fact_inventory":     {"snapshot_date": "DATE", "on_hand_units": "INT", "reserved_units": "INT"},
+    "fact_reviews":       {"review_date": "DATE", "rating": "INT"},
+}
+
+shape_rows, convert_rows = [], []
+for t in EXPECTED_ROWS:
+    df = spark.table(fq(f"bronze_{t}"))
+    biz = [c for c in df.columns if not c.startswith("_")]
+    null_aggs = [F.count(F.when(F.col(c).isNull(), 1)).alias(f"__n_{c}") for c in biz]
+    cast_aggs = [F.count(F.when(F.col(c).isNotNull() & F.expr(f"try_cast({c} AS {ty}) IS NULL"), 1)).alias(f"__c_{c}")
+                 for c, ty in TYPE_TARGETS.get(t, {}).items()]
+    r = df.agg(*null_aggs, *cast_aggs).first()
+    null_cols = {c: r[f"__n_{c}"] for c in biz if r[f"__n_{c}"]}
+    shape_rows.append((t, EXPECTED_ROWS[t], len(biz), sum(null_cols.values()) if null_cols else 0,
+                       ", ".join(f"{c}={v}" for c, v in null_cols.items()) or "none"))
+    for c, ty in TYPE_TARGETS.get(t, {}).items():
+        convert_rows.append((t, c, ty, r[f"__c_{c}"]))
+
+display(spark.createDataFrame(shape_rows, "table STRING, rows LONG, business_columns INT, null_values LONG, columns_with_nulls STRING"))
+display(spark.createDataFrame(convert_rows, "table STRING, column STRING, casts_to STRING, conversion_failures LONG"))
+assert all(x[3] == 0 for x in convert_rows), "Some values do not convert - inspect before Silver rejects them"
+print("PASS: every date/number column converts cleanly. The only NULL business value is fact_orders.campaign_id (organic orders).")
+
+# COMMAND ----------
+
+# DBTITLE 1,Profile 2: grain and key uniqueness
+# Question 2 - GRAIN: what does one row mean, and is the key really unique?
+# A duplicate key does not fail a join - it MULTIPLIES one. Silver quarantines duplicates under
+# `pk_unique`; profiling finds them first, while it is still a source problem, not a pipeline event.
+
+GRAIN = {
+    "dim_brand":           ("one brand", ["brand_id"]),
+    "dim_channel":         ("one sales channel", ["channel_id"]),
+    "dim_market":          ("one city market", ["market_id"]),
+    "dim_product":         ("one product", ["product_id"]),
+    "dim_campaign":        ("one campaign", ["campaign_id"]),
+    "fact_orders":         ("one order line: one product within one order", ["order_line_id"]),
+    "fact_campaign_daily": ("one campaign x product x market x channel x day",
+                            ["campaign_id", "product_id", "market_id", "channel_id", "event_date"]),
+    "fact_inventory":      ("one product x market on one snapshot day", ["snapshot_id"]),
+    "fact_reviews":        ("one product review", ["review_id"]),
+}
+
+grain_rows = []
+for t, (meaning, keys) in GRAIN.items():
+    df = spark.table(fq(f"bronze_{t}"))
+    n, d = df.count(), df.agg(F.countDistinct(*keys)).first()[0]
+    grain_rows.append((t, meaning, " + ".join(keys), n, d, n - d, "PASS" if n == d else "FAIL"))
+display(spark.createDataFrame(grain_rows,
+    "table STRING, one_row_means STRING, key_columns STRING, rows LONG, distinct_keys LONG, duplicate_rows LONG, status STRING"))
+assert all(g[-1] == "PASS" for g in grain_rows), "Duplicate keys: Silver would quarantine every copy - find out why first"
+print("PASS: every declared key is unique. Fan-out can still occur between tables of DIFFERENT grains - see section 9.")
+
+# COMMAND ----------
+
+# DBTITLE 1,Profile 3: distributions and anomalies
+# Question 3 - DISTRIBUTIONS: smallest, largest and most common values.
+# Reading the raw strings (not pre-cast types) means we see exactly what the source sent.
+
+DIST_NUMERIC = {       # table -> {column: type to try_cast for min/max}
+    "fact_orders":        {"order_date": "DATE", "quantity": "INT", "net_sales_usd": "DECIMAL(12,2)"},
+    "fact_campaign_daily": {"event_date": "DATE", "impressions": "BIGINT", "spend_usd": "DECIMAL(12,2)"},
+    "fact_inventory":     {"on_hand_units": "INT"},
+    "fact_reviews":       {"rating": "INT"},
+    "dim_product":        {"list_price_usd": "DECIMAL(10,2)"},
+    "dim_campaign":       {"budget_usd": "DECIMAL(12,2)"},
+}
+DIST_CATEGORICAL = {   # table -> columns whose most common value is informative
+    "fact_orders": ["channel_id", "market_id"],
+    "dim_product": ["category"],
+    "dim_brand":   ["tier"],
+    "fact_reviews": ["sentiment_hint"],
+}
+
+dist_rows = []
+for t, cols in DIST_NUMERIC.items():
+    df = spark.table(fq(f"bronze_{t}"))
+    aggs = []
+    for c, ty in cols.items():
+        aggs += [F.min(F.expr(f"try_cast({c} AS {ty})")).alias(f"mn_{c}"),
+                 F.max(F.expr(f"try_cast({c} AS {ty})")).alias(f"mx_{c}")]
+    r = df.agg(*aggs).first()
+    dist_rows += [(f"{t}.{c}", str(r[f"mn_{c}"]), str(r[f"mx_{c}"]), None) for c in cols]
+for t, cols in DIST_CATEGORICAL.items():
+    df = spark.table(fq(f"bronze_{t}"))
+    for c in cols:
+        top = df.groupBy(c).count().orderBy(F.desc("count")).first()
+        dist_rows.append((f"{t}.{c}", None, None, f"{top[0]} ({top[1]} rows)"))
+display(spark.createDataFrame(dist_rows, "column STRING, smallest STRING, largest STRING, most_common STRING"))
+
+# Values that would be legal strings but illegal business data. Expected: all zero.
+anomalies = [
+    ("quantity <= 0",        f"SELECT count(*) FROM {fq('bronze_fact_orders')} WHERE try_cast(quantity AS INT) <= 0"),
+    ("order_date in future", f"SELECT count(*) FROM {fq('bronze_fact_orders')} WHERE try_cast(order_date AS DATE) > current_date()"),
+    ("negative net sales",  f"SELECT count(*) FROM {fq('bronze_fact_orders')} WHERE try_cast(net_sales_usd AS DECIMAL(12,2)) < 0"),
+    ("clicks > impressions", f"SELECT count(*) FROM {fq('bronze_fact_campaign_daily')} WHERE try_cast(clicks AS BIGINT) > try_cast(impressions AS BIGINT)"),
+    ("reserved > on hand",  f"SELECT count(*) FROM {fq('bronze_fact_inventory')} WHERE try_cast(reserved_units AS INT) > try_cast(on_hand_units AS INT)"),
+    ("rating outside 1-5",  f"SELECT count(*) FROM {fq('bronze_fact_reviews')} WHERE try_cast(rating AS INT) NOT BETWEEN 1 AND 5"),
+]
+anom_rows = [(name, spark.sql(q).first()[0]) for name, q in anomalies]
+display(spark.createDataFrame(anom_rows, "anomaly STRING, rows LONG"))
+assert all(n == 0 for _, n in anom_rows), "Anomalies found in the baseline data - investigate before cleaning"
+print("PASS: no negative quantities, future dates, or out-of-range values in the baseline")
+
+# COMMAND ----------
+
+# DBTITLE 1,Profile 4: join keys and orphan checks
+# Question 4 - RELATIONSHIPS: when these tables join, do the keys match?
+# Orphan keys (a sale whose product does not exist) are exactly what Silver's fk_* rules quarantine.
+# Counting them here turns a surprise quarantine later into a known source issue today.
+
+FKS = [   # (child table, fk column, parent table, parent key, NULL allowed?)
+    ("dim_product",         "brand_id",    "dim_brand",     "brand_id",    False),
+    ("dim_campaign",        "brand_id",    "dim_brand",     "brand_id",    False),
+    ("fact_orders",         "product_id",  "dim_product",   "product_id",  False),
+    ("fact_orders",         "market_id",   "dim_market",    "market_id",   False),
+    ("fact_orders",         "channel_id",  "dim_channel",   "channel_id",  False),
+    ("fact_orders",         "campaign_id", "dim_campaign",  "campaign_id", True),   # NULL = organic order, allowed
+    ("fact_campaign_daily", "campaign_id", "dim_campaign",  "campaign_id", False),
+    ("fact_campaign_daily", "product_id",  "dim_product",   "product_id",  False),
+    ("fact_campaign_daily", "market_id",   "dim_market",    "market_id",   False),
+    ("fact_campaign_daily", "channel_id",  "dim_channel",   "channel_id",  False),
+    ("fact_inventory",      "product_id", "dim_product",    "product_id",  False),
+    ("fact_inventory",      "market_id",  "dim_market",     "market_id",   False),
+    ("fact_reviews",        "product_id", "dim_product",    "product_id",  False),
+    ("fact_reviews",        "market_id",  "dim_market",     "market_id",   False),
+]
+
+rel_rows = []
+for child, fk, parent, pk, nullable in FKS:
+    c = spark.table(fq(f"bronze_{child}"))
+    if nullable:
+        c = c.filter(F.col(fk).isNotNull())
+    p = spark.table(fq(f"bronze_{parent}")).select(F.col(pk).alias("__pk"))
+    orphans = c.join(p, F.col(fk) == F.col("__pk"), "left_anti").count()
+    rel_rows.append((f"{child}.{fk}", f"{parent}.{pk}",
+                     "NULL allowed" if nullable else "NOT NULL expected", orphans,
+                     "PASS" if orphans == 0 else "FAIL"))
+display(spark.createDataFrame(rel_rows, "child_key STRING, references STRING, null_policy STRING, orphan_keys LONG, status STRING"))
+assert all(r[-1] == "PASS" for r in rel_rows), "Orphan keys found - inspect before Silver quarantines them"
+print("PASS: no orphan keys. (Section 8's injected P999 product would show up here as 1 orphan before any cleaning.)")
+
+# COMMAND ----------
+
+# DBTITLE 1,Profile 5: reconciliation and meaning
+# Questions 5 & 6 - RECONCILIATION and MEANING: do totals that should agree actually agree,
+# and would a domain expert believe this data? Still on bronze, still before any cleaning.
+# The three WARNs are known generator quirks, kept on purpose; section 10 re-checks them on gold.
+
+net_bad = spark.sql(f"""SELECT count(*) FROM {fq('bronze_fact_orders')} WHERE
+    abs(try_cast(gross_sales_usd AS DECIMAL(12,2)) - try_cast(discount_usd AS DECIMAL(12,2))
+        - try_cast(returns_usd AS DECIMAL(12,2)) - try_cast(net_sales_usd AS DECIMAL(12,2))) > 0.01""").first()[0]
+
+spend_ratio = spark.sql(f"""
+    WITH per_campaign AS (
+      SELECT c.campaign_id,
+             sum(try_cast(d.spend_usd AS DECIMAL(12,2))) AS spend,
+             max(try_cast(c.budget_usd AS DECIMAL(12,2))) AS budget
+      FROM {fq('bronze_fact_campaign_daily')} d JOIN {fq('bronze_dim_campaign')} c USING (campaign_id)
+      GROUP BY c.campaign_id)
+    SELECT round(min(spend / budget), 2) AS min_ratio, round(max(spend / budget), 2) AS max_ratio,
+           count_if(spend > budget) AS overspent
+    FROM per_campaign""").first()
+
+attrib = spark.sql(f"""
+    SELECT (SELECT round(sum(try_cast(attributed_revenue_usd AS DECIMAL(12,2))), 2)
+            FROM {fq('bronze_fact_campaign_daily')}) AS attributed,
+           (SELECT round(sum(try_cast(net_sales_usd AS DECIMAL(12,2))), 2)
+            FROM {fq('bronze_fact_orders')}) AS net_sales""").first()
+
+sent = spark.sql(f"""SELECT count_if(try_cast(rating AS INT) BETWEEN 1 AND 2 AND sentiment_hint = 'positive') AS mismatch,
+                          count_if(try_cast(rating AS INT) BETWEEN 1 AND 2) AS low_rated
+                   FROM {fq('bronze_fact_reviews')}""").first()
+
+profile_findings = [
+    ("net_sales_formula",
+     f"{net_bad} of {EXPECTED_ROWS['fact_orders']} order rows break net = gross - discount - returns",
+     "PASS" if net_bad == 0 else "FAIL"),
+    ("spend_vs_budget",
+     f"{spend_ratio.overspent} of {EXPECTED_ROWS['dim_campaign']} campaigns spent more than budget; "
+     f"spend/budget ranges {spend_ratio.min_ratio}x to {spend_ratio.max_ratio}x", "WARN"),
+    ("attributed_vs_net_sales",
+     f"attributed revenue {attrib.attributed} is {round(float(attrib.attributed) / float(attrib.net_sales), 2)}x "
+     f"company net sales {attrib.net_sales}", "WARN"),
+    ("rating_vs_sentiment",
+     f"{sent.mismatch} of {sent.low_rated} reviews rated 1-2 stars carry sentiment_hint = 'positive'", "WARN"),
+]
+display(spark.createDataFrame(profile_findings, "check STRING, finding STRING, status STRING"))
+assert net_bad == 0, "Row-level arithmetic breaks: reconcile before trusting any Silver sum"
+print("Structural checks PASS. The 3 WARNs are business-plausibility findings, not load blockers - same ones as section 10.")
 
 # COMMAND ----------
 
@@ -827,12 +1279,13 @@ display(spark.sql(f"""SELECT severity, status, count(*) AS checks FROM {fq('dq_r
 # MAGIC ## 12. Lineage and the evidence to keep
 # MAGIC 1. **Catalog → workspace → ai_architect_lab → gold_sales_lines → Lineage tab → See lineage graph.** You should see `gold_sales_lines` fed by the silver tables, and those fed by bronze. Lineage can take a few minutes to appear. If the tab is empty or unavailable in your workspace, write that down rather than assuming it works.
 # MAGIC 2. Open `silver_fact_orders` → **History** tab: each `createOrReplace` is a Delta version, and you can query it with `VERSION AS OF`.
-# MAGIC 3. Save to `docs/evidence_log.md`: the bronze counts, recon table, acceptance result (26/26), the defect quarantine output, the constraint rejection message, the fan-out numbers, the plausibility warnings and a lineage screenshot.
+# MAGIC 3. Save to `docs/evidence_log.md`: the bronze counts, the 3b profiling findings (shape / grain / distributions / relationships / the 3 WARNs), recon table, acceptance result (26/26), the defect quarantine output, the constraint rejection message, the fan-out numbers, the plausibility warnings and a lineage screenshot.
 # MAGIC
 # MAGIC **What lineage proves and what it doesn't:** it proves *which objects fed which*. It does **not** prove the logic is correct. That is the job of the acceptance tests.
 # MAGIC
 # MAGIC ## ✅ Day 2 exit gate: go to Day 3 only if all of these are true
 # MAGIC - [ ] Bronze: 9 tables, counts match
+# MAGIC - [ ] Profiling (3b): structural checks PASS (0 conversion failures, 0 duplicate keys, 0 orphans); the 3 WARNs (overspend 7-12x, attribution 2.07x, 134/396 sentiment) understood
 # MAGIC - [ ] Silver: 9 tables reconciled, 0 quarantined, constraints visible
 # MAGIC - [ ] Gold: 25,000 / 5,880 / 12 rows
 # MAGIC - [ ] Acceptance 26/26
