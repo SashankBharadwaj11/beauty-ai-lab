@@ -590,6 +590,8 @@ print(f"PASS: {len(acceptance)} / {len(acceptance)} acceptance values match")
 # MAGIC ### 🎙️ Drill 1: explain the data to the business (2 minutes, out loud, before reading the hints)
 # MAGIC **Kamal (client):** *"Skip the medallion talk. I'm the marketing director. Why should I believe that Atlanta was our best market last quarter?"*
 # MAGIC
+# MAGIC *In the real client round Kamal interrupted twice: "Let's start slow… explain me your business case again. Don't go to technology." Open with the user and the decision, never the stack.*
+# MAGIC
 # MAGIC Points a strong answer covers (in your own words, not memorised):
 # MAGIC * Business first: what the number is (net sales after discounts and returns) and the period (July to September 2026, by order date).
 # MAGIC * Completeness: 25,000 source rows in, 25,000 validated, 0 rejected, and the reconciliation is logged.

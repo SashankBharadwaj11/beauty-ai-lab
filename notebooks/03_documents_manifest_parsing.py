@@ -182,10 +182,15 @@ print("PASS: every discrepancy detected and named")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 🎙️ Drill 1: Kamal's exact question, answered with today's evidence (2 minutes)
-# MAGIC **Kamal:** *"You keep saying 'we use OCR'. That's not my question. How do you **know** all the documents were processed correctly before embedding?"*
+# MAGIC ### 🎙️ Drill 1: Kamal's exact questions from the client round, answered with today's evidence (2 minutes)
+# MAGIC **Kamal (verbatim):** *"Before you go to embedding, how are you making sure all your documents are processed, right? What is the way for verifying that everything has been processed correctly?"*
+# MAGIC **Follow-up (verbatim):** *"My simple question is: your document which is coming with different formats, were you dealing with the standard format every time, or is it like you are not aware of what the format of document can be? … How are you making sure all the tables and images are processed?"*
 # MAGIC
-# MAGIC Points to cover in your own words:
+# MAGIC **What happened in the real round:** the first answer was a long pipeline description, so he had to ask the "simple question". **Rule: answer the literal question in one sentence first**, then two or three points, then stop.
+# MAGIC * Q1 opener: *"We reconcile against a manifest: expected = processed + failed + pending, by name and content hash, before anything is embedded."*
+# MAGIC * Follow-up opener: *"Unknown formats. We don't assume templates, so we route by file type and check each output for text, tables and pages."*
+# MAGIC
+# MAGIC Points to cover after the opener, in your own words:
 # MAGIC * Start from **the expected set**: the manifest from the source system, not "whatever is in the folder".
 # MAGIC * **Name and hash** reconciliation tells you missing, changed and unknown files apart, and each gets a different action.
 # MAGIC * Only `OK` files go on to parsing. Everything else goes to an exception list with an owner.
