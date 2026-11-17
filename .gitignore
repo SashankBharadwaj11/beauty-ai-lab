@@ -21,3 +21,7 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+
+# Local experiment outputs (generated, not source data)
+artifacts/
+!data/.gitkeep
